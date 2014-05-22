@@ -25,10 +25,12 @@ import optparse
 import operator
 from ansible import errors
 from ansible import __version__
-from ansible.utils.plugins import *
 from ansible.utils import template
+from ansible.utils.display_functions import *
+from ansible.utils.plugins import *
 from ansible.callbacks import display
 import ansible.constants as C
+import ast
 import time
 import StringIO
 import stat
@@ -41,15 +43,12 @@ import warnings
 import traceback
 import getpass
 import sys
-import textwrap
+import json
 
-import vault
+#import vault
+from vault import VaultLib
 
 VERBOSITY=0
-
-# list of all deprecation messages to prevent duplicate display
-deprecations = {}
-warns = {}
 
 MAX_FILE_SIZE_FOR_DIFF=1*1024*1024
 
@@ -72,9 +71,28 @@ except:
 
 KEYCZAR_AVAILABLE=False
 try:
-    import keyczar.errors as key_errors
-    from keyczar.keys import AesKey
-    KEYCZAR_AVAILABLE=True
+    try:
+        # some versions of pycrypto may not have this?
+        from Crypto.pct_warnings import PowmInsecureWarning
+    except ImportError:
+        PowmInsecureWarning = RuntimeWarning
+
+    with warnings.catch_warnings(record=True) as warning_handler:
+        warnings.simplefilter("error", PowmInsecureWarning)
+        try:
+            import keyczar.errors as key_errors
+            from keyczar.keys import AesKey
+        except PowmInsecureWarning:
+            system_warning(
+                "The version of gmp you have installed has a known issue regarding " + \
+                "timing vulnerabilities when used with pycrypto. " + \
+                "If possible, you should update it (ie. yum update gmp)."
+            )
+            warnings.resetwarnings()
+            warnings.simplefilter("ignore")
+            import keyczar.errors as key_errors
+            from keyczar.keys import AesKey
+        KEYCZAR_AVAILABLE=True
 except ImportError:
     pass
 
@@ -97,7 +115,7 @@ def key_for_hostname(hostname):
         raise errors.AnsibleError('ACCELERATE_KEYS_DIR is not a directory.')
 
     if stat.S_IMODE(os.stat(key_path).st_mode) != int(C.ACCELERATE_KEYS_DIR_PERMS, 8):
-        raise errors.AnsibleError('Incorrect permissions on ACCELERATE_KEYS_DIR (%s)' % (C.ACCELERATE_KEYS_DIR,))
+        raise errors.AnsibleError('Incorrect permissions on the private key directory. Use `chmod 0%o %s` to correct this issue, and make sure any of the keys files contained within that directory are set to 0%o' % (int(C.ACCELERATE_KEYS_DIR_PERMS, 8), C.ACCELERATE_KEYS_DIR, int(C.ACCELERATE_KEYS_FILE_PERMS, 8)))
 
     key_path = os.path.join(key_path, hostname)
 
@@ -111,7 +129,7 @@ def key_for_hostname(hostname):
         return key
     else:
         if stat.S_IMODE(os.stat(key_path).st_mode) != int(C.ACCELERATE_KEYS_FILE_PERMS, 8):
-            raise errors.AnsibleError('Incorrect permissions on ACCELERATE_KEYS_FILE (%s)' % (key_path,))
+            raise errors.AnsibleError('Incorrect permissions on the key file for this host. Use `chmod 0%o %s` to correct this issue.' % (int(C.ACCELERATE_KEYS_FILE_PERMS, 8), key_path))
         fh = open(key_path)
         key = AesKey.Read(fh.read())
         fh.close()
@@ -191,7 +209,7 @@ def check_conditional(conditional, basedir, inject, fail_on_undefined=False):
 
     conditional = conditional.replace("jinja2_compare ","")
     # allow variable names
-    if conditional in inject and str(inject[conditional]).find('-') == -1:
+    if conditional in inject and '-' not in str(inject[conditional]):
         conditional = inject[conditional]
     conditional = template.template(basedir, conditional, inject, fail_on_undefined=fail_on_undefined)
     original = str(conditional).replace("jinja2_compare ","")
@@ -204,9 +222,9 @@ def check_conditional(conditional, basedir, inject, fail_on_undefined=False):
         # variable was undefined. If we happened to be 
         # looking for an undefined variable, return True,
         # otherwise fail
-        if conditional.find("is undefined") != -1:
+        if "is undefined" in conditional:
             return True
-        elif conditional.find("is defined") != -1:
+        elif "is defined" in conditional:
             return False
         else:
             raise errors.AnsibleError("error while evaluating conditional: %s" % original)
@@ -312,7 +330,7 @@ def parse_json(raw_data):
             raise
 
         for t in tokens:
-            if t.find("=") == -1:
+            if "=" not in t:
                 raise errors.AnsibleError("failed to parse: %s" % orig_data)
             (key,value) = t.split("=", 1)
             if key == 'changed' or 'failed':
@@ -329,9 +347,9 @@ def parse_json(raw_data):
 
 def smush_braces(data):
     ''' smush Jinaj2 braces so unresolved templates like {{ foo }} don't get parsed weird by key=value code '''
-    while data.find('{{ ') != -1:
+    while '{{ ' in data:
         data = data.replace('{{ ', '{{')
-    while data.find(' }}') != -1:
+    while ' }}' in data:
         data = data.replace(' }}', '}}')
     return data
 
@@ -349,14 +367,30 @@ def smush_ds(data):
     else:
         return data
 
-def parse_yaml(data):
-    ''' convert a yaml string to a data structure '''
-    return smush_ds(yaml.safe_load(data))
+def parse_yaml(data, path_hint=None):
+    ''' convert a yaml string to a data structure.  Also supports JSON, ssssssh!!!'''
+
+    stripped_data = data.lstrip()
+    loaded = None
+    if stripped_data.startswith("{") or stripped_data.startswith("["):
+        # since the line starts with { or [ we can infer this is a JSON document.
+        try:
+            loaded = json.loads(data)
+        except ValueError, ve:
+            if path_hint:
+                raise errors.AnsibleError(path_hint + ": " + str(ve))
+            else:
+                raise errors.AnsibleError(str(ve))
+    else:
+        # else this is pretty sure to be a YAML document
+        loaded = yaml.safe_load(data)
+
+    return smush_ds(loaded)
 
 def process_common_errors(msg, probline, column):
     replaced = probline.replace(" ","")
 
-    if replaced.find(":{{") != -1 and replaced.find("}}") != -1:
+    if ":{{" in replaced and "}}" in replaced:
         msg = msg + """
 This one looks easy to fix.  YAML thought it was looking for the start of a 
 hash/dictionary and was confused to see a second "{".  Most likely this was
@@ -374,7 +408,7 @@ It should be written as:
 """
         return msg
 
-    elif len(probline) and len(probline) >= column and probline[column] == ":" and probline.count(':') > 1:
+    elif len(probline) and len(probline) > 1 and len(probline) > column and probline[column] == ":" and probline.count(':') > 1:
         msg = msg + """
 This one looks easy to fix.  There seems to be an extra unquoted colon in the line 
 and this is confusing the parser. It was only expecting to find one free 
@@ -406,7 +440,7 @@ Or:
                 match = True
             elif middle.startswith('"') and not middle.endswith('"'):
                 match = True
-            if len(middle) > 0 and middle[0] in [ '"', "'" ] and middle[-1] in [ '"', "'" ] and probline.count("'") > 2 or probline.count("'") > 2:
+            if len(middle) > 0 and middle[0] in [ '"', "'" ] and middle[-1] in [ '"', "'" ] and probline.count("'") > 2 or probline.count('"') > 2:
                 unbalanced = True
             if match:
                 msg = msg + """
@@ -445,32 +479,33 @@ Could be written as:
 
     return msg
 
-def process_yaml_error(exc, data, path=None):
+def process_yaml_error(exc, data, path=None, show_content=True):
     if hasattr(exc, 'problem_mark'):
         mark = exc.problem_mark
-        if mark.line -1 >= 0:
-            before_probline = data.split("\n")[mark.line-1]
-        else:
-            before_probline = ''
-        probline = data.split("\n")[mark.line]
-        arrow = " " * mark.column + "^"
-        msg = """Syntax Error while loading YAML script, %s
+        if show_content:
+            if mark.line -1 >= 0:
+                before_probline = data.split("\n")[mark.line-1]
+            else:
+                before_probline = ''
+            probline = data.split("\n")[mark.line]
+            arrow = " " * mark.column + "^"
+            msg = """Syntax Error while loading YAML script, %s
 Note: The error may actually appear before this position: line %s, column %s
 
 %s
 %s
 %s""" % (path, mark.line + 1, mark.column + 1, before_probline, probline, arrow)
 
-        unquoted_var = None
-        if '{{' in probline and '}}' in probline:
-            if '"{{' not in probline or "'{{" not in probline:
-                unquoted_var = True
+            unquoted_var = None
+            if '{{' in probline and '}}' in probline:
+                if '"{{' not in probline or "'{{" not in probline:
+                    unquoted_var = True
 
-        msg = process_common_errors(msg, probline, mark.column)
-        if not unquoted_var:
             msg = process_common_errors(msg, probline, mark.column)
-        else:
-            msg = msg + """
+            if not unquoted_var:
+                msg = process_common_errors(msg, probline, mark.column)
+            else:
+                msg = msg + """
 We could be wrong, but this one looks like it might be an issue with
 missing quotes.  Always quote template expression brackets when they 
 start a value. For instance:            
@@ -484,7 +519,15 @@ Should be written as:
       - "{{ foo }}"      
 
 """
-            msg = process_common_errors(msg, probline, mark.column)
+                msg = process_common_errors(msg, probline, mark.column)
+        else:
+            # most likely displaying a file with sensitive content,
+            # so don't show any of the actual lines of yaml just the
+            # line number itself
+            msg = """Syntax error while loading YAML script, %s
+The error appears to have been on line %s, column %s, but may actually
+be before there depending on the exact syntax problem.
+""" % (path, mark.line + 1, mark.column + 1)
 
     else:
         # No problem markers means we have to throw a generic
@@ -500,20 +543,22 @@ def parse_yaml_from_file(path, vault_password=None):
     ''' convert a yaml file to a data structure '''
 
     data = None
-
-    #VAULT
-    if vault.is_encrypted(path):
-        data = vault.decrypt(path, vault_password)
-    else:
-        try:
-            data = open(path).read()
-        except IOError:
-            raise errors.AnsibleError("file could not read: %s" % path)
+    show_content = True
 
     try:
-        return parse_yaml(data)
+        data = open(path).read()
+    except IOError:
+        raise errors.AnsibleError("file could not read: %s" % path)
+
+    vault = VaultLib(password=vault_password)
+    if vault.is_encrypted(data):
+        data = vault.decrypt(data)
+        show_content = False
+
+    try:
+        return parse_yaml(data, path_hint=path)
     except yaml.YAMLError, exc:
-        process_yaml_error(exc, data, path)
+        process_yaml_error(exc, data, path, show_content)
 
 def parse_kv(args):
     ''' convert a string of key/value items to a dict '''
@@ -521,10 +566,16 @@ def parse_kv(args):
     if args is not None:
         # attempting to split a unicode here does bad things
         args = args.encode('utf-8')
-        vargs = [x.decode('utf-8') for x in shlex.split(args, posix=True)]
-        #vargs = shlex.split(str(args), posix=True)
+        try:
+            vargs = shlex.split(args, posix=True)
+        except ValueError, ve:
+            if 'no closing quotation' in str(ve).lower():
+                raise errors.AnsibleError("error parsing argument string, try quoting the entire line.")
+            else:
+                raise
+        vargs = [x.decode('utf-8') for x in vargs]
         for x in vargs:
-            if x.find("=") != -1:
+            if "=" in x:
                 k, v = x.split("=",1)
                 options[k]=v
     return options
@@ -565,12 +616,15 @@ def md5(filename):
         return None
     digest = _md5()
     blocksize = 64 * 1024
-    infile = open(filename, 'rb')
-    block = infile.read(blocksize)
-    while block:
-        digest.update(block)
+    try:
+        infile = open(filename, 'rb')
         block = infile.read(blocksize)
-    infile.close()
+        while block:
+            digest.update(block)
+            block = infile.read(blocksize)
+        infile.close()
+    except IOError, e:
+        raise errors.AnsibleError("error while accessing the file %s, error was: %s" % (filename, e))
     return digest.hexdigest()
 
 def default(value, function):
@@ -701,10 +755,12 @@ def base_parser(constants=C, usage="", output_opts=False, runas_opts=False,
         help='use this file to authenticate the connection')
     parser.add_option('-K', '--ask-sudo-pass', default=False, dest='ask_sudo_pass', action='store_true',
         help='ask for sudo password')
-    parser.add_option('--ask-su-pass', default=False, dest='ask_su_pass',
-                      action='store_true', help='ask for su password')
-    parser.add_option('--ask-vault-pass', default=False, dest='ask_vault_pass',
-                      action='store_true', help='ask for vault password')
+    parser.add_option('--ask-su-pass', default=False, dest='ask_su_pass', action='store_true', 
+        help='ask for su password')
+    parser.add_option('--ask-vault-pass', default=False, dest='ask_vault_pass', action='store_true', 
+        help='ask for vault password')
+    parser.add_option('--vault-password-file', default=None, dest='vault_password_file',
+        help="vault password file")
     parser.add_option('--list-hosts', dest='listhosts', action='store_true',
         help='outputs a list of matching hosts; does not execute anything else')
     parser.add_option('-M', '--module-path', dest='module_path',
@@ -784,6 +840,12 @@ def ask_vault_passwords(ask_vault_pass=False, ask_new_vault_pass=False, confirm_
         if new_vault_pass != new_vault_pass2:
             raise errors.AnsibleError("Passwords do not match")
 
+    # enforce no newline chars at the end of passwords
+    if vault_pass:
+        vault_pass = vault_pass.strip()
+    if new_vault_pass:
+        new_vault_pass = new_vault_pass.strip()
+
     return vault_pass, new_vault_pass
 
 def ask_passwords(ask_pass=False, ask_sudo_pass=False, ask_su_pass=False, ask_vault_pass=False):
@@ -848,10 +910,11 @@ def filter_leading_non_json_lines(buf):
     filter only leading lines since multiline JSON is valid.
     '''
 
+    kv_regex = re.compile(r'.*\w+=\w+.*')
     filtered_lines = StringIO.StringIO()
     stop_filtering = False
     for line in buf.splitlines():
-        if stop_filtering or "=" in line or line.startswith('{') or line.startswith('['):
+        if stop_filtering or kv_regex.match(line) or line.startswith('{') or line.startswith('['):
             stop_filtering = True
             filtered_lines.write(line + '\n')
     return filtered_lines.getvalue()
@@ -942,51 +1005,95 @@ def is_list_of_strings(items):
             return False
     return True
 
-def safe_eval(str, locals=None, include_exceptions=False):
+def safe_eval(expr, locals={}, include_exceptions=False):
     '''
     this is intended for allowing things like:
     with_items: a_list_variable
     where Jinja2 would return a string
     but we do not want to allow it to call functions (outside of Jinja2, where
     the env is constrained)
+
+    Based on:
+    http://stackoverflow.com/questions/12523516/using-ast-and-whitelists-to-make-pythons-eval-safe
     '''
-    # FIXME: is there a more native way to do this?
 
-    def is_set(var):
-        return not var.startswith("$") and not '{{' in var
+    # this is the whitelist of AST nodes we are going to 
+    # allow in the evaluation. Any node type other than 
+    # those listed here will raise an exception in our custom
+    # visitor class defined below.
+    SAFE_NODES = set(
+        (
+            ast.Expression,
+            ast.Compare,
+            ast.Str,
+            ast.List,
+            ast.Tuple,
+            ast.Dict,
+            ast.Call,
+            ast.Load,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Num,
+            ast.Name,
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+        )
+    )
 
-    def is_unset(var):
-        return var.startswith("$") or '{{' in var
+    # AST node types were expanded after 2.6
+    if not sys.version.startswith('2.6'):
+        SAFE_NODES.union(
+            set(
+                (ast.Set,)
+            )
+        )
 
-    # do not allow method calls to modules
-    if not isinstance(str, basestring):
+    # builtin functions that are not safe to call
+    INVALID_CALLS = (
+       'classmethod', 'compile', 'delattr', 'eval', 'execfile', 'file',
+       'filter', 'help', 'input', 'object', 'open', 'raw_input', 'reduce',
+       'reload', 'repr', 'setattr', 'staticmethod', 'super', 'type',
+    )
+
+    class CleansingNodeVisitor(ast.NodeVisitor):
+        def generic_visit(self, node):
+            if type(node) not in SAFE_NODES:
+                #raise Exception("invalid expression (%s) type=%s" % (expr, type(node)))
+                raise Exception("invalid expression (%s)" % expr)
+            super(CleansingNodeVisitor, self).generic_visit(node)
+        def visit_Call(self, call):
+            if call.func.id in INVALID_CALLS:
+                raise Exception("invalid function: %s" % call.func.id)
+
+    if not isinstance(expr, basestring):
         # already templated to a datastructure, perhaps?
         if include_exceptions:
-            return (str, None)
-        return str
-    if re.search(r'\w\.\w+\(', str):
-        if include_exceptions:
-            return (str, None)
-        return str
-    # do not allow imports
-    if re.search(r'import \w+', str):
-        if include_exceptions:
-            return (str, None)
-        return str
+            return (expr, None)
+        return expr
+
     try:
-        result = None
-        if not locals:
-            result = eval(str)
-        else:
-            result = eval(str, None, locals)
+        parsed_tree = ast.parse(expr, mode='eval')
+        cnv = CleansingNodeVisitor()
+        cnv.visit(parsed_tree)
+        compiled = compile(parsed_tree, expr, 'eval')
+        result = eval(compiled, {}, locals)
+
         if include_exceptions:
             return (result, None)
         else:
             return result
+    except SyntaxError, e:
+        # special handling for syntax errors, we just return
+        # the expression string back as-is
+        if include_exceptions:
+            return (expr, None)
+        return expr
     except Exception, e:
         if include_exceptions:
-            return (str, e)
-        return str
+            return (expr, e)
+        return expr
 
 
 def listify_lookup_plugin_terms(terms, basedir, inject):
@@ -998,12 +1105,12 @@ def listify_lookup_plugin_terms(terms, basedir, inject):
         #    with_items: {{ alist }}
 
         stripped = terms.strip()
-        if not (stripped.startswith('{') or stripped.startswith('[')) and not stripped.startswith("/"):
+        if not (stripped.startswith('{') or stripped.startswith('[')) and not stripped.startswith("/") and not stripped.startswith('set(['):
             # if not already a list, get ready to evaluate with Jinja2
             # not sure why the "/" is in above code :)
             try:
                 new_terms = template.template(basedir, "{{ %s }}" % terms, inject)
-                if isinstance(new_terms, basestring) and new_terms.find("{{") != -1:
+                if isinstance(new_terms, basestring) and "{{" in new_terms:
                     pass
                 else:
                     terms = new_terms
@@ -1020,36 +1127,6 @@ def listify_lookup_plugin_terms(terms, basedir, inject):
             terms = [ terms ]
 
     return terms
-
-def deprecated(msg, version, removed=False):
-    ''' used to print out a deprecation message.'''
-
-    if not removed and not C.DEPRECATION_WARNINGS:
-        return
-
-    if not removed:
-        if version:
-            new_msg = "\n[DEPRECATION WARNING]: %s. This feature will be removed in version %s." % (msg, version)
-        else:
-            new_msg = "\n[DEPRECATION WARNING]: %s. This feature will be removed in a future release." % (msg)
-        new_msg = new_msg + " Deprecation warnings can be disabled by setting deprecation_warnings=False in ansible.cfg.\n\n"
-    else:
-        raise errors.AnsibleError("[DEPRECATED]: %s.  Please update your playbooks." % msg)
-
-    wrapped = textwrap.wrap(new_msg, 79)
-    new_msg = "\n".join(wrapped) + "\n"
-
-    if new_msg not in deprecations:
-        display(new_msg, color='purple', stderr=True)
-        deprecations[new_msg] = 1
-
-def warning(msg):
-    new_msg = "\n[WARNING]: %s" % msg
-    wrapped = textwrap.wrap(new_msg, 79)
-    new_msg = "\n".join(wrapped) + "\n"
-    if new_msg not in warns:
-        display(new_msg, color='bright purple', stderr=True)
-        warns[new_msg] = 1
 
 def combine_vars(a, b):
 
@@ -1068,3 +1145,13 @@ def random_password(length=20, chars=C.DEFAULT_PASSWORD_CHARS):
             password.append(new_char)
 
     return ''.join(password)
+
+def before_comment(msg):
+    ''' what's the part of a string before a comment? '''
+    msg = msg.replace("\#","**NOT_A_COMMENT**")
+    msg = msg.split("#")[0]
+    msg = msg.replace("**NOT_A_COMMENT**","#")
+    return msg
+
+
+

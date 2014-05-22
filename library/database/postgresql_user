@@ -176,7 +176,7 @@ def user_add(cursor, user, password, role_attr_flags,  encrypted, expires):
         query = query + " PASSWORD %(password)s"
         query_password_data.update(password=password)
     if expires is not None:
-        query = query + " VALID UNTIL '%(expires)s'" % { "exipres": expires }
+        query = query + " VALID UNTIL '%(expires)s'" % { "expires": expires }
     query = query + " " + role_attr_flags
     cursor.execute(query, query_password_data)
     return True
@@ -443,9 +443,9 @@ def main():
             priv=dict(default=None),
             db=dict(default=''),
             port=dict(default='5432'),
-            fail_on_user=dict(type='bool', choices=BOOLEANS, default='yes'),
+            fail_on_user=dict(type='bool', default='yes'),
             role_attr_flags=dict(default=''),
-            encrypted=dict(type='bool', choices=BOOLEANS, default='no'),
+            encrypted=dict(type='bool', default='no'),
             expires=dict(default=None)
         ),
         supports_check_mode = True
